@@ -1,0 +1,703 @@
+# WorldClimate - фиксация времени и погоды в отдельных мирах (Nukkit-MOT).
+# Положи файл в репозиторий как .github/workflows/worldclimate.yml
+# и запусти: Actions -> Build WorldClimate -> Run workflow. Jar будет в Artifacts.
+name: Build WorldClimate
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/worldclimate.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Write plugin sources
+        run: |
+          mkdir -p $(dirname pom.xml)
+          cat > pom.xml <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>worldclimate</groupId>
+            <artifactId>WorldClimate</artifactId>
+            <version>1.0.0</version>
+            <properties>
+              <maven.compiler.source>17</maven.compiler.source>
+              <maven.compiler.target>17</maven.compiler.target>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+            <dependencies>
+              <dependency>
+                <groupId>com.nukkit-mot</groupId>
+                <artifactId>nukkit-mot</artifactId>
+                <version>1.26.30-R1</version>
+                <scope>provided</scope>
+                <exclusions>
+                  <exclusion>
+                    <groupId>*</groupId>
+                    <artifactId>*</artifactId>
+                  </exclusion>
+                </exclusions>
+              </dependency>
+            </dependencies>
+            <build>
+              <finalName>WorldClimate-${project.version}</finalName>
+            </build>
+          </project>
+          EOF
+          mkdir -p $(dirname src/main/resources/plugin.yml)
+          cat > src/main/resources/plugin.yml <<'EOF'
+          name: WorldClimate
+          main: worldclimate.WorldClimate
+          version: "1.0.0"
+          api: ["1.0.0"]
+          author: jaryshak
+          description: Фиксация времени и погоды в отдельных мирах MultiWorld
+          softdepend: ["MultiWorld", "FunTools"]
+
+          commands:
+            mwtime:
+              description: Зафиксировать время суток в мире
+              usage: "/mwtime <ID мира> <1-5>"
+              permission: worldclimate.admin
+            mwpog:
+              description: Зафиксировать погоду в мире
+              usage: "/mwpog <ID мира> <1-5>"
+              permission: worldclimate.admin
+            mwotmena:
+              description: Снять фиксацию времени и погоды
+              usage: "/mwotmena <ID мира> [time|pog]"
+              permission: worldclimate.admin
+            mwtpm:
+              description: Графическое меню WorldClimate
+              usage: "/mwtpm"
+              permission: worldclimate.admin
+
+          permissions:
+            worldclimate.admin:
+              description: Все команды WorldClimate
+              default: op
+            worldclimate.bypass:
+              description: Обход запрета /day /setnight /time /weather в зафиксированных мирах
+              default: "false"
+          EOF
+          mkdir -p $(dirname src/main/resources/config.yml)
+          cat > src/main/resources/config.yml <<'EOF'
+          # WorldClimate
+
+          # Тики для ID времени (0 = рассвет, 6000 = полдень, 12000 = закат, 18000 = полночь)
+          time-ticks:
+            morning: 1000     # 1 - Утро
+            noon: 6000        # 2 - Полдень
+            evening: 12000    # 3 - Вечер
+            night: 13000      # 4 - Начало ночи
+            midnight: 18000   # 5 - Полночь
+
+          lightning:
+            # Сколько молний в минуту на одного игрока даёт обычная гроза (режим 3).
+            # Режим 4 = 3x от этого значения, режим 5 = 10x. Подстрой под свой сервер.
+            base-per-minute: 1.0
+            min-range: 6              # молнии бьют не ближе, чем N блоков от игрока
+            max-range: 48             # и не дальше
+            max-per-second-per-world: 20
+            harmless: false           # true - молнии без урона и поджогов
+
+          # Команды, которые не работают в мирах с зафиксированным временем / погодой.
+          # Игрок с правом worldclimate.bypass может их использовать.
+          block:
+            time-commands: [day, setnight, time]
+            weather-commands: [weather, toggledownfall]
+          EOF
+          mkdir -p $(dirname src/main/java/worldclimate/WorldClimate.java)
+          cat > src/main/java/worldclimate/WorldClimate.java <<'EOF'
+          package worldclimate;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.entity.Entity;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.EventPriority;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.player.PlayerCommandPreprocessEvent;
+          import cn.nukkit.event.player.PlayerFormRespondedEvent;
+          import cn.nukkit.form.element.ElementButton;
+          import cn.nukkit.form.element.ElementDropdown;
+          import cn.nukkit.form.element.ElementInput;
+          import cn.nukkit.form.element.ElementLabel;
+          import cn.nukkit.form.response.FormResponseCustom;
+          import cn.nukkit.form.response.FormResponseSimple;
+          import cn.nukkit.form.window.FormWindow;
+          import cn.nukkit.form.window.FormWindowCustom;
+          import cn.nukkit.form.window.FormWindowSimple;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.level.Position;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.scheduler.Task;
+          import cn.nukkit.utils.Config;
+
+          import java.io.File;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.Random;
+
+          public class WorldClimate extends PluginBase implements Listener {
+
+              private static final int MAX_ID = 32; // 0 = основной мир, 1-30 = mw1..mw30, 31 = nether, 32 = the_end
+
+              private static final String[] TIME_NAMES = {"Утро", "Полдень", "Вечер", "Начало ночи", "Полночь"};
+              private static final String[] TIME_KEYS = {"morning", "noon", "evening", "night", "midnight"};
+              private static final int[] TIME_DEFAULTS = {1000, 6000, 12000, 13000, 18000};
+
+              private static final String[] WEATHER_NAMES = {
+                      "Ясная погода", "Дождь", "Гроза", "Очень сильная гроза (молнии x3)", "Супер шторм (молнии x10)"};
+
+              private static final double[] LIGHTNING_MULT = {0, 0, 0, 3, 10};
+
+              private final Map<Integer, Integer> timeLocks = new HashMap<>();
+              private final Map<Integer, Integer> weatherLocks = new HashMap<>();
+              private final Map<Integer, Level> primedTime = new HashMap<>();
+              private final Map<Integer, Level> primedWeather = new HashMap<>();
+              private final Random rnd = new Random();
+              private Config data;
+              private int counter = 0;
+              private boolean warnedRules = false;
+
+              // ---------------------------------------------------------------- жизненный цикл
+
+              @Override
+              public void onEnable() {
+                  saveDefaultConfig();
+                  data = new Config(new File(getDataFolder(), "locks.yml"), Config.YAML);
+                  for (int i = 0; i <= MAX_ID; i++) {
+                      int t = data.getInt("time." + i, 0);
+                      int w = data.getInt("weather." + i, 0);
+                      if (t >= 1 && t <= 5) timeLocks.put(i, t);
+                      if (w >= 1 && w <= 5) weatherLocks.put(i, w);
+                  }
+                  getServer().getPluginManager().registerEvents(this, this);
+
+                  getServer().getScheduler().scheduleRepeatingTask(new Task() {
+                      @Override
+                      public void onRun(int tick) {
+                          try {
+                              enforce(false);
+                          } catch (Throwable t) {
+                              getLogger().error("Ошибка в enforce", t);
+                          }
+                      }
+                  }, 10);
+
+                  getServer().getScheduler().scheduleRepeatingTask(new Task() {
+                      @Override
+                      public void onRun(int tick) {
+                          try {
+                              lightningTick();
+                          } catch (Throwable t) {
+                              getLogger().error("Ошибка в lightningTick", t);
+                          }
+                      }
+                  }, 20);
+
+                  // через 5 секунд догружаем миры, для которых сохранены настройки
+                  getServer().getScheduler().scheduleDelayedTask(new Task() {
+                      @Override
+                      public void onRun(int tick) {
+                          for (Integer id : new ArrayList<>(timeLocks.keySet())) getLevel(id);
+                          for (Integer id : new ArrayList<>(weatherLocks.keySet())) getLevel(id);
+                          enforce(true);
+                      }
+                  }, 100);
+
+                  getLogger().info("WorldClimate включён. Фиксаций времени: " + timeLocks.size()
+                          + ", погоды: " + weatherLocks.size());
+              }
+
+              // ---------------------------------------------------------------- миры
+
+              private String levelName(int id) {
+                  if (id == 31) return "nether";
+                  if (id == 32) return "the_end";
+                  return "mw" + id;
+              }
+
+              /** Загруженный мир или null. */
+              private Level loaded(int id) {
+                  if (id == 0) return getServer().getDefaultLevel();
+                  return getServer().getLevelByName(levelName(id));
+              }
+
+              /** Мир; если не загружен, но папка есть - загружает. */
+              private Level getLevel(int id) {
+                  Level l = loaded(id);
+                  if (l != null || id == 0) return l;
+                  String name = levelName(id);
+                  if (new File(getServer().getDataPath() + "worlds/" + name).exists()) {
+                      getServer().loadLevel(name);
+                      l = getServer().getLevelByName(name);
+                  }
+                  return l;
+              }
+
+              private int worldIdOf(Level l) {
+                  if (l == null) return -1;
+                  if (l == getServer().getDefaultLevel()) return 0;
+                  for (int i = 1; i <= MAX_ID; i++) {
+                      if (getServer().getLevelByName(levelName(i)) == l) return i;
+                  }
+                  return -1;
+              }
+
+              // ---------------------------------------------------------------- reflection-помощники
+
+              private void setRule(Level level, String ruleField, boolean value) {
+                  try {
+                      Class<?> grc = Class.forName("cn.nukkit.level.GameRule");
+                      Object rule = grc.getField(ruleField).get(null);
+                      Object rules = level.getClass().getMethod("getGameRules").invoke(level);
+                      rules.getClass().getMethod("setGameRule", grc, boolean.class).invoke(rules, rule, value);
+                      try {
+                          Class<?> pc = Class.forName("cn.nukkit.network.protocol.GameRulesChangedPacket");
+                          Class<?> dp = Class.forName("cn.nukkit.network.protocol.DataPacket");
+                          Object pk = pc.getDeclaredConstructor().newInstance();
+                          pc.getField("gameRules").set(pk, rules);
+                          for (Player p : new ArrayList<>(level.getPlayers().values())) {
+                              p.getClass().getMethod("dataPacket", dp).invoke(p, pk);
+                          }
+                      } catch (Throwable ignored) {
+                      }
+                  } catch (Throwable t) {
+                      if (!warnedRules) {
+                          warnedRules = true;
+                          getLogger().warning("Не удалось поменять gamerule " + ruleField + ": " + t);
+                      }
+                  }
+              }
+
+              private void callNoArg(Object o, String method) {
+                  try {
+                      o.getClass().getMethod(method).invoke(o);
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              private void callInt(Object o, String method, int v) {
+                  try {
+                      o.getClass().getMethod(method, int.class).invoke(o, v);
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              // ---------------------------------------------------------------- применение времени и погоды
+
+              private int ticksFor(int timeId) {
+                  int i = timeId - 1;
+                  return getConfig().getInt("time-ticks." + TIME_KEYS[i], TIME_DEFAULTS[i]);
+              }
+
+              private void enforce(boolean force) {
+                  counter++;
+                  boolean resync = force || counter % 10 == 0;     // раз в ~5 с повторно шлём клиентам время и gamerule
+                  boolean refresh = force || counter % 60 == 0;    // раз в ~30 с обновляем таймеры погоды
+
+                  for (Map.Entry<Integer, Integer> en : timeLocks.entrySet()) {
+                      int id = en.getKey();
+                      Level l = loaded(id);
+                      if (l == null) continue;
+                      int target = ticksFor(en.getValue());
+                      if (primedTime.get(id) != l || resync) {
+                          setRule(l, "DO_DAYLIGHT_CYCLE", false);
+                          callNoArg(l, "stopTime");
+                          primedTime.put(id, l);
+                      }
+                      int cur = ((l.getTime() % 24000) + 24000) % 24000;
+                      if (cur != target || resync) l.setTime(target);
+                  }
+
+                  for (Map.Entry<Integer, Integer> en : weatherLocks.entrySet()) {
+                      int id = en.getKey();
+                      Level l = loaded(id);
+                      if (l == null) continue;
+                      int mode = en.getValue();
+                      if (primedWeather.get(id) != l || resync) {
+                          setRule(l, "DO_WEATHER_CYCLE", false);
+                          primedWeather.put(id, l);
+                      }
+                      boolean rain = mode >= 2;
+                      boolean thunder = mode >= 3;
+                      if (l.isRaining() != rain) l.setRaining(rain);
+                      if (l.isThundering() != thunder) l.setThundering(thunder);
+                      if (refresh) {
+                          callInt(l, "setRainTime", 1000000);
+                          callInt(l, "setThunderTime", 1000000);
+                      }
+                  }
+              }
+
+              private void lightningTick() {
+                  double base = getConfig().getDouble("lightning.base-per-minute", 1.0);
+                  int cap = getConfig().getInt("lightning.max-per-second-per-world", 20);
+                  for (Map.Entry<Integer, Integer> en : weatherLocks.entrySet()) {
+                      int mode = en.getValue();
+                      if (mode < 4) continue;
+                      Level l = loaded(en.getKey());
+                      if (l == null) continue;
+                      // природная гроза уже даёт "1x"; плагин добавляет недостающие (k-1)x
+                      double lambda = (LIGHTNING_MULT[mode - 1] - 1.0) * base / 60.0;
+                      int total = 0;
+                      for (Player p : new ArrayList<>(l.getPlayers().values())) {
+                          int n = (int) lambda + (rnd.nextDouble() < lambda - (int) lambda ? 1 : 0);
+                          for (int i = 0; i < n && total < cap; i++) {
+                              strike(l, p);
+                              total++;
+                          }
+                      }
+                  }
+              }
+
+              private void strike(Level l, Player p) {
+                  double min = getConfig().getDouble("lightning.min-range", 6);
+                  double max = getConfig().getDouble("lightning.max-range", 48);
+                  double ang = rnd.nextDouble() * Math.PI * 2;
+                  double dist = min + rnd.nextDouble() * Math.max(1, max - min);
+                  int x = (int) Math.floor(p.x + Math.cos(ang) * dist);
+                  int z = (int) Math.floor(p.z + Math.sin(ang) * dist);
+                  if (!l.isChunkLoaded(x >> 4, z >> 4)) return;
+                  int y = l.getHighestBlockAt(x, z) + 1;
+                  Entity e = Entity.createEntity("Lightning", new Position(x + 0.5, y, z + 0.5, l));
+                  if (e == null) return;
+                  if (getConfig().getBoolean("lightning.harmless", false)) {
+                      try {
+                          e.getClass().getMethod("setEffect", boolean.class).invoke(e, false);
+                      } catch (Throwable ignored) {
+                      }
+                  }
+                  e.spawnToAll();
+              }
+
+              // ---------------------------------------------------------------- действия (общие для команд и меню)
+
+              private String doTime(int id, int val) {
+                  if (id < 0 || id > MAX_ID) return "§cID мира: от 0 до " + MAX_ID + " (0 - основной, 1-30 - миры, 31 - незер, 32 - энд).";
+                  if (val < 1 || val > 5) return "§cID времени: 1-5 (1 Утро, 2 Полдень, 3 Вечер, 4 Начало ночи, 5 Полночь).";
+                  Level l = getLevel(id);
+                  if (l == null) return "§cМир с ID " + id + " не найден или не загружен.";
+                  timeLocks.put(id, val);
+                  data.set("time." + id, val);
+                  data.save();
+                  primedTime.remove(id);
+                  enforce(true);
+                  return "§aМир " + id + ": время зафиксировано - §e" + TIME_NAMES[val - 1] + "§a. Снять: /mwotmena " + id + " time";
+              }
+
+              private String doWeather(int id, int val) {
+                  if (id < 0 || id > MAX_ID) return "§cID мира: от 0 до " + MAX_ID + " (0 - основной, 1-30 - миры, 31 - незер, 32 - энд).";
+                  if (val < 1 || val > 5) return "§cID погоды: 1-5 (1 Ясно, 2 Дождь, 3 Гроза, 4 Очень сильная гроза, 5 Супер шторм).";
+                  Level l = getLevel(id);
+                  if (l == null) return "§cМир с ID " + id + " не найден или не загружен.";
+                  weatherLocks.put(id, val);
+                  data.set("weather." + id, val);
+                  data.save();
+                  primedWeather.remove(id);
+                  enforce(true);
+                  return "§aМир " + id + ": погода зафиксирована - §e" + WEATHER_NAMES[val - 1] + "§a. Снять: /mwotmena " + id + " pog";
+              }
+
+              /** scope: 0 - всё, 1 - только время, 2 - только погода */
+              private String doRelease(int id, int scope) {
+                  if (id < 0 || id > MAX_ID) return "§cID мира: от 0 до " + MAX_ID + ".";
+                  boolean had = false;
+                  Level l = loaded(id);
+                  if ((scope == 0 || scope == 1) && timeLocks.remove(id) != null) {
+                      had = true;
+                      data.remove("time." + id);
+                      primedTime.remove(id);
+                      if (l != null) {
+                          setRule(l, "DO_DAYLIGHT_CYCLE", true);
+                          callNoArg(l, "startTime");
+                      }
+                  }
+                  if ((scope == 0 || scope == 2) && weatherLocks.remove(id) != null) {
+                      had = true;
+                      data.remove("weather." + id);
+                      primedWeather.remove(id);
+                      if (l != null) {
+                          setRule(l, "DO_WEATHER_CYCLE", true);
+                          callInt(l, "setRainTime", 6000 + rnd.nextInt(6000));
+                          callInt(l, "setThunderTime", 6000 + rnd.nextInt(6000));
+                      }
+                  }
+                  if (!had) return "§eВ мире " + id + " нечего снимать - там и так природное время и погода.";
+                  data.save();
+                  return "§aМир " + id + ": фиксация снята, время и погода снова идут естественно.";
+              }
+
+              private String statusText() {
+                  StringBuilder sb = new StringBuilder();
+                  for (int i = 0; i <= MAX_ID; i++) {
+                      Integer t = timeLocks.get(i);
+                      Integer w = weatherLocks.get(i);
+                      if (t == null && w == null) continue;
+                      sb.append("§6Мир ").append(i).append("§r\n");
+                      sb.append("  Время: ").append(t == null ? "§7природное§r" : "§e" + TIME_NAMES[t - 1] + "§r").append("\n");
+                      sb.append("  Погода: ").append(w == null ? "§7природная§r" : "§e" + WEATHER_NAMES[w - 1] + "§r").append("\n");
+                  }
+                  if (sb.length() == 0) return "Нигде ничего не зафиксировано - везде природные время и погода.";
+                  return sb.toString();
+              }
+
+              private static String infoText() {
+                  return "§l§6WorldClimate§r - фиксация времени и погоды в отдельных мирах.\n\n"
+                          + "§e/mwtime <ID мира> <1-5>§r\n"
+                          + "Всегда одно и то же время суток:\n"
+                          + " 1 - Утро\n 2 - Полдень\n 3 - Вечер\n 4 - Начало ночи\n 5 - Полночь\n\n"
+                          + "§e/mwpog <ID мира> <1-5>§r\n"
+                          + "Всегда одна и та же погода:\n"
+                          + " 1 - Ясная погода\n 2 - Дождь\n 3 - Гроза\n"
+                          + " 4 - Очень сильная гроза (молнии в 3 раза чаще)\n"
+                          + " 5 - Супер шторм (молнии в 10 раз чаще)\n\n"
+                          + "§e/mwotmena <ID мира> [time|pog]§r\n"
+                          + "Снять фиксацию и вернуть природные время и погоду. "
+                          + "Без второго аргумента снимает и время, и погоду; time - только время; pog - только погоду.\n\n"
+                          + "§e/mwtpm§r\n"
+                          + "Это меню.\n\n"
+                          + "§7ID мира: 0 - основной мир, 1-30 - миры MultiWorld, 31 - незер, 32 - энд.\n"
+                          + "В мирах с зафиксированным временем не работают /day, /setnight, /time, "
+                          + "а в мирах с зафиксированной погодой - /weather, /toggledownfall "
+                          + "(список меняется в config.yml). Право worldclimate.bypass обходит запрет.";
+              }
+
+              // ---------------------------------------------------------------- команды
+
+              private int parse(String s) {
+                  try {
+                      return Integer.parseInt(s.trim());
+                  } catch (Exception e) {
+                      return -1;
+                  }
+              }
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
+                  String n = cmd.getName().toLowerCase(Locale.ROOT);
+                  switch (n) {
+                      case "mwtime":
+                          if (args.length < 2) {
+                              sender.sendMessage("§eИспользование: /mwtime <ID мира> <1-5>\n"
+                                      + "§71 Утро, 2 Полдень, 3 Вечер, 4 Начало ночи, 5 Полночь");
+                              return true;
+                          }
+                          sender.sendMessage(doTime(parse(args[0]), parse(args[1])));
+                          return true;
+                      case "mwpog":
+                          if (args.length < 2) {
+                              sender.sendMessage("§eИспользование: /mwpog <ID мира> <1-5>\n"
+                                      + "§71 Ясно, 2 Дождь, 3 Гроза, 4 Очень сильная гроза (x3), 5 Супер шторм (x10)");
+                              return true;
+                          }
+                          sender.sendMessage(doWeather(parse(args[0]), parse(args[1])));
+                          return true;
+                      case "mwotmena": {
+                          if (args.length < 1) {
+                              sender.sendMessage("§eИспользование: /mwotmena <ID мира> [time|pog]");
+                              return true;
+                          }
+                          int scope = 0;
+                          if (args.length >= 2) {
+                              String a = args[1].toLowerCase(Locale.ROOT);
+                              if (a.equals("time") || a.equals("t") || a.equals("время")) scope = 1;
+                              else if (a.equals("pog") || a.equals("weather") || a.equals("погода")) scope = 2;
+                              else {
+                                  sender.sendMessage("§eВторой аргумент: time или pog (или ничего - снять всё).");
+                                  return true;
+                              }
+                          }
+                          sender.sendMessage(doRelease(parse(args[0]), scope));
+                          return true;
+                      }
+                      case "mwtpm":
+                          if (!(sender instanceof Player)) {
+                              sender.sendMessage("§cМеню только для игроков.");
+                              return true;
+                          }
+                          ((Player) sender).showFormWindow(new MainForm());
+                          return true;
+                      default:
+                          return false;
+                  }
+              }
+
+              // ---------------------------------------------------------------- блокировка конфликтующих команд
+
+              @EventHandler(priority = EventPriority.HIGHEST)
+              public void onCommandPre(PlayerCommandPreprocessEvent e) {
+                  String msg = e.getMessage();
+                  if (msg == null || !msg.startsWith("/")) return;
+                  Player p = e.getPlayer();
+                  if (p.hasPermission("worldclimate.bypass")) return;
+                  String[] parts = msg.substring(1).trim().split("\\s+");
+                  if (parts.length == 0) return;
+                  String label = parts[0].toLowerCase(Locale.ROOT);
+                  int c = label.indexOf(':');
+                  if (c >= 0) label = label.substring(c + 1);
+
+                  int id = worldIdOf(p.getLevel());
+                  if (id < 0) return;
+
+                  if (timeLocks.containsKey(id) && listHas("block.time-commands", label, "day", "setnight", "time")) {
+                      e.setCancelled(true);
+                      p.sendMessage("§cВ этом мире время зафиксировано (§e" + TIME_NAMES[timeLocks.get(id) - 1]
+                              + "§c), команда /" + label + " здесь не работает.");
+                      return;
+                  }
+                  if (weatherLocks.containsKey(id) && listHas("block.weather-commands", label, "weather", "toggledownfall")) {
+                      e.setCancelled(true);
+                      p.sendMessage("§cВ этом мире погода зафиксирована (§e" + WEATHER_NAMES[weatherLocks.get(id) - 1]
+                              + "§c), команда /" + label + " здесь не работает.");
+                  }
+              }
+
+              private boolean listHas(String path, String label, String... defaults) {
+                  List<String> list = getConfig().getStringList(path);
+                  if (list == null || list.isEmpty()) list = Arrays.asList(defaults);
+                  for (String s : list) {
+                      if (s != null && s.trim().equalsIgnoreCase(label)) return true;
+                  }
+                  return false;
+              }
+
+              // ---------------------------------------------------------------- графическое меню
+
+              private class MainForm extends FormWindowSimple {
+                  MainForm() {
+                      super("§l§6WorldClimate", "Фиксация времени и погоды в мирах.\nВыбери действие:");
+                      addButton(new ElementButton("Установить время"));
+                      addButton(new ElementButton("Установить погоду"));
+                      addButton(new ElementButton("Снять фиксацию (природный режим)"));
+                      addButton(new ElementButton("Активные настройки"));
+                      addButton(new ElementButton("Информация и команды"));
+                  }
+              }
+
+              private class BackForm extends FormWindowSimple {
+                  BackForm(String title, String content) {
+                      super(title, content);
+                      addButton(new ElementButton("Назад в меню"));
+                  }
+              }
+
+              private class TimeForm extends FormWindowCustom {
+                  TimeForm(Player p) {
+                      super("§l§6Время мира");
+                      addElement(new ElementLabel("Время будет зафиксировано в выбранном мире."));
+                      addElement(new ElementInput("ID мира (0-" + MAX_ID + ")", "например 1", defaultWorld(p)));
+                      addElement(new ElementDropdown("Время суток", Arrays.asList(
+                              "1. Утро", "2. Полдень", "3. Вечер", "4. Начало ночи", "5. Полночь"), 1));
+                  }
+              }
+
+              private class WeatherForm extends FormWindowCustom {
+                  WeatherForm(Player p) {
+                      super("§l§6Погода мира");
+                      addElement(new ElementLabel("Погода будет зафиксирована в выбранном мире."));
+                      addElement(new ElementInput("ID мира (0-" + MAX_ID + ")", "например 1", defaultWorld(p)));
+                      addElement(new ElementDropdown("Погода", Arrays.asList(
+                              "1. Ясная погода", "2. Дождь", "3. Гроза",
+                              "4. Очень сильная гроза (молнии x3)", "5. Супер шторм (молнии x10)"), 0));
+                  }
+              }
+
+              private class ReleaseForm extends FormWindowCustom {
+                  ReleaseForm(Player p) {
+                      super("§l§6Снять фиксацию");
+                      addElement(new ElementLabel("Вернуть природный ход времени и погоды."));
+                      addElement(new ElementInput("ID мира (0-" + MAX_ID + ")", "например 1", defaultWorld(p)));
+                      addElement(new ElementDropdown("Что снять", Arrays.asList(
+                              "Время и погоду", "Только время", "Только погоду"), 0));
+                  }
+              }
+
+              private String defaultWorld(Player p) {
+                  int id = worldIdOf(p.getLevel());
+                  return String.valueOf(Math.max(id, 0));
+              }
+
+              @EventHandler
+              public void onForm(PlayerFormRespondedEvent e) {
+                  FormWindow w = e.getWindow();
+                  if (!(w instanceof MainForm || w instanceof BackForm || w instanceof TimeForm
+                          || w instanceof WeatherForm || w instanceof ReleaseForm)) return;
+                  Player p = e.getPlayer();
+                  if (!p.hasPermission("worldclimate.admin")) return;
+                  if (e.wasClosed() || e.getResponse() == null) return;
+
+                  if (w instanceof MainForm) {
+                      int b = ((FormResponseSimple) e.getResponse()).getClickedButtonId();
+                      switch (b) {
+                          case 0:
+                              p.showFormWindow(new TimeForm(p));
+                              break;
+                          case 1:
+                              p.showFormWindow(new WeatherForm(p));
+                              break;
+                          case 2:
+                              p.showFormWindow(new ReleaseForm(p));
+                              break;
+                          case 3:
+                              p.showFormWindow(new BackForm("§l§6Активные настройки", statusText()));
+                              break;
+                          case 4:
+                              p.showFormWindow(new BackForm("§l§6Информация", infoText()));
+                              break;
+                          default:
+                              break;
+                      }
+                      return;
+                  }
+                  if (w instanceof BackForm) {
+                      p.showFormWindow(new MainForm());
+                      return;
+                  }
+
+                  FormResponseCustom r = (FormResponseCustom) e.getResponse();
+                  int id = parse(String.valueOf(r.getInputResponse(1)));
+                  int pick = r.getDropdownResponse(2).getElementID();
+                  String result;
+                  if (w instanceof TimeForm) result = doTime(id, pick + 1);
+                  else if (w instanceof WeatherForm) result = doWeather(id, pick + 1);
+                  else result = doRelease(id, pick);
+                  p.sendMessage(result);
+                  p.showFormWindow(new MainForm());
+              }
+          }
+          EOF
+
+      - name: Build
+        run: |
+          ok=0
+          for i in 1 2 3; do
+            echo "=== Попытка сборки $i ==="
+            if timeout 240 mvn -B clean package; then ok=1; break; fi
+            echo "Попытка $i не удалась или зависла, пробую снова"
+          done
+          [ "$ok" = 1 ]
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WorldClimate-jar
+          path: target/WorldClimate-1.0.0.jar
